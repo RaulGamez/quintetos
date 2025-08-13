@@ -1,30 +1,31 @@
 # streamlit_app.py
 # -------------------------------------------------------------
-# Gestor de quintetos FBCV (norma pasarela) con Firestore (DB)
+# Gestor de quintetos FBCV (norma pasarela) con Supabase (DB)
 # -------------------------------------------------------------
-import time, random
+import time, random, os
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
 import streamlit as st
 
-# ============== Firestore (Google Cloud) ==============
+# --- Supabase client (v2) ---
 try:
-    from google.cloud import firestore
-    from google.oauth2 import service_account
+    from supabase import create_client, Client
 except Exception:
-    st.error("Falta el paquete google-cloud-firestore. Añade 'google-cloud-firestore' a requirements.txt.")
     st.stop()
 
+# ===========================
+# Configuración / Conexión DB
+# ===========================
 st.set_page_config(page_title="Quintetos FBCV - Norma Pasarela", layout="wide")
 
-# Carga de credenciales desde Secrets (JSON de cuenta de servicio)
-if "gcp_service_account" not in st.secrets:
-    st.error("Añade tu JSON de cuenta de servicio a Secrets como 'gcp_service_account'.")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL")
+SUPABASE_KEY = st.secrets.get("SUPABASE_ANON_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Faltan SUPABASE_URL y SUPABASE_ANON_KEY en Secrets.")
     st.stop()
 
-creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
-db = firestore.Client(project=st.secrets["gcp_service_account"]["project_id"], credentials=creds)
+sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ===========================
 # Reglas Pasarela (FBCV)
@@ -69,128 +70,104 @@ class Schedule:
     lineups: Dict[int, Lineup] = field(default_factory=dict)
 
 # ===========================
-# Helpers DB (Firestore)
+# Helpers DB
 # ===========================
 def _hash_password(pw: str) -> str:
     import hashlib
     return hashlib.sha256(pw.encode("utf-8")).hexdigest()
 
-# Estructura de colecciones:
-# - users (doc id = username) -> {username, password_hash, created_at}
-# - teams (doc id = team_id)  -> {id, owner, name, category, created_at}
-# - players (doc id = player_id) -> {id, team_id, name, rating, created_at}
-# - rules (doc id = team_id)  -> {team_id, strict, updated_at}
-# - rules_together (autoid)   -> {team_id, a, b, created_at}
-# - rules_apart (autoid)      -> {team_id, a, b, created_at}
-# - ratings (autoid)          -> {team_id, signature, rating, notes, created_at}
-
 # ---- USERS ----
 def db_user_get(username: str) -> Optional[dict]:
-    doc = db.collection("users").document(username).get()
-    return doc.to_dict() if doc.exists else None
+    r = sb.table("users").select("*").eq("username", username).execute()
+    return r.data[0] if r.data else None
 
 def db_user_create(username: str, password_hash: str):
-    db.collection("users").document(username).set({
-        "username": username,
-        "password_hash": password_hash,
-        "created_at": firestore.SERVER_TIMESTAMP
-    })
+    sb.table("users").insert({"username": username, "password_hash": password_hash}).execute()
 
 # ---- TEAMS ----
 def db_teams_by_owner(owner: str) -> List[dict]:
-    q = db.collection("teams").where("owner", "==", owner).order_by("created_at").stream()
-    return [dict(doc.to_dict()) for doc in q]
+    return sb.table("teams").select("*").eq("owner", owner).order("created_at").execute().data
 
 def db_team_get(team_id: str) -> Optional[dict]:
-    doc = db.collection("teams").document(team_id).get()
-    return doc.to_dict() if doc.exists else None
+    r = sb.table("teams").select("*").eq("id", team_id).single().execute()
+    return r.data if r.data else None
 
 def db_team_create(owner: str, name: str, category: str) -> dict:
     team_id = f"{owner}:{int(time.time()*1000)}"
-    db.collection("teams").document(team_id).set({
-        "id": team_id, "owner": owner, "name": name, "category": category,
-        "created_at": firestore.SERVER_TIMESTAMP
-    })
-    db.collection("rules").document(team_id).set({
-        "team_id": team_id, "strict": False, "updated_at": firestore.SERVER_TIMESTAMP
-    })
+    sb.table("teams").insert({"id": team_id, "owner": owner, "name": name, "category": category}).execute()
+    # crea reglas por defecto
+    sb.table("rules").upsert({"team_id": team_id, "strict": False}).execute()
     return {"id": team_id, "owner": owner, "name": name, "category": category}
 
 def db_team_update(team_id: str, name: str, category: str):
-    db.collection("teams").document(team_id).update({"name": name, "category": category})
+    sb.table("teams").update({"name": name, "category": category}).eq("id", team_id).execute()
 
 # ---- PLAYERS ----
 def db_players_by_team(team_id: str) -> List[dict]:
-    q = db.collection("players").where("team_id", "==", team_id).order_by("created_at").stream()
-    return [dict(doc.to_dict()) for doc in q]
+    return sb.table("players").select("*").eq("team_id", team_id).order("created_at").execute().data
 
 def db_player_add(team_id: str, name: str, rating: int) -> dict:
     pid = f"{int(time.time()*1000)}-{random.randint(100,999)}"
-    db.collection("players").document(pid).set({
-        "id": pid, "team_id": team_id, "name": name, "rating": int(rating),
-        "created_at": firestore.SERVER_TIMESTAMP
-    })
-    return {"id": pid, "team_id": team_id, "name": name, "rating": int(rating)}
+    sb.table("players").insert({"id": pid, "team_id": team_id, "name": name, "rating": rating}).execute()
+    return {"id": pid, "team_id": team_id, "name": name, "rating": rating}
 
 def db_player_update(pid: str, name: str, rating: int):
-    db.collection("players").document(pid).update({"name": name, "rating": int(rating)})
+    sb.table("players").update({"name": name, "rating": rating}).eq("id", pid).execute()
 
 def db_player_delete(pid: str):
-    db.collection("players").document(pid).delete()
+    sb.table("players").delete().eq("id", pid).execute()
 
 # ---- RULES ----
 def db_rules_get(team_id: str) -> Dict:
-    doc = db.collection("rules").document(team_id).get()
-    strict = bool(doc.to_dict().get("strict")) if doc.exists else False
-    tog_q = db.collection("rules_together").where("team_id", "==", team_id).stream()
-    apt_q = db.collection("rules_apart").where("team_id", "==", team_id).stream()
-    together = [[d.to_dict()["a"], d.to_dict()["b"]] for d in tog_q]
-    apart = [[d.to_dict()["a"], d.to_dict()["b"]] for d in apt_q]
-    # normaliza orden a<b
-    together = [sorted(p) for p in together if len(p) == 2]
-    apart = [sorted(p) for p in apart if len(p) == 2]
-    return {"strict": strict, "together": together, "apart": apart}
+    # reglas base
+    r = sb.table("rules").select("*").eq("team_id", team_id).single().execute()
+    strict = bool(r.data["strict"]) if r.data else False
+    # pares
+    tog = sb.table("rules_together").select("a,b").eq("team_id", team_id).execute().data
+    apt = sb.table("rules_apart").select("a,b").eq("team_id", team_id).execute().data
+    return {
+        "strict": strict,
+        "together": [[row["a"], row["b"]] for row in tog],
+        "apart": [[row["a"], row["b"]] for row in apt],
+    }
 
 def db_rules_set_strict(team_id: str, strict: bool):
-    db.collection("rules").document(team_id).set({
-        "team_id": team_id, "strict": bool(strict), "updated_at": firestore.SERVER_TIMESTAMP
-    }, merge=True)
+    sb.table("rules").upsert({"team_id": team_id, "strict": strict}).execute()
 
 def db_rules_add_pairs(team_id: str, table: str, pairs: List[List[str]]):
-    col = "rules_together" if table == "rules_together" else "rules_apart"
-    batch = db.batch()
-    for a, b in pairs:
-        a2, b2 = sorted([a, b])
-        ref = db.collection(col).document()
-        batch.set(ref, {"team_id": team_id, "a": a2, "b": b2, "created_at": firestore.SERVER_TIMESTAMP})
-    if pairs:
-        batch.commit()
+    rows = [{"team_id": team_id, "a": p[0], "b": p[1]} for p in pairs]
+    if rows:
+        sb.table(table).insert(rows, count="none").execute()
 
 def db_rules_delete_pair(team_id: str, table: str, a: str, b: str):
-    col = "rules_together" if table == "rules_together" else "rules_apart"
-    a2, b2 = sorted([a, b])
-    q = db.collection(col).where("team_id","==",team_id).where("a","==",a2).where("b","==",b2).stream()
-    for doc in q:
-        doc.reference.delete()
+    # Está normalizado (a,b) ordenados
+    sb.table(table).delete().eq("team_id", team_id).eq("a", a).eq("b", b).execute()
 
-# ---- RATINGS ----
+# ---- RATINGS (valoración de quintetos) ----
 def db_rate_lineup(team_id: str, signature: str, rating: int, notes: str = ""):
-    db.collection("ratings").document().set({
-        "team_id": team_id, "signature": signature, "rating": int(rating), "notes": notes,
-        "created_at": firestore.SERVER_TIMESTAMP
-    })
+    sb.table("ratings").insert({
+        "team_id": team_id, "signature": signature, "rating": rating, "notes": notes
+    }).execute()
 
 def db_top_lineups(team_id: str, top_k: int = 10) -> List[List[str]]:
-    # Promedia en cliente (sencillo y suficiente para los volúmenes esperados)
-    rows = [d.to_dict() for d in db.collection("ratings").where("team_id","==",team_id).stream()]
+    # AVG por signature
+    q = """
+    select signature
+    from ratings
+    where team_id = %(tid)s
+    group by signature
+    order by avg(rating) desc
+    limit %(k)s
+    """
+    # Supabase python v2 no expone SQL parametrizado directo; usa rpc o filter. Simplificamos con dos pasos:
+    rows = sb.table("ratings").select("signature, rating").eq("team_id", team_id).execute().data
     from collections import defaultdict
     acc = defaultdict(lambda: {"sum":0, "n":0})
     for r in rows:
-        sig = r.get("signature","")
-        if not sig: continue
-        acc[sig]["sum"] += int(r.get("rating",0))
+        sig = r["signature"]
+        acc[sig]["sum"] += int(r["rating"])
         acc[sig]["n"] += 1
-    avg_list = [(v["sum"]/v["n"], s) for s, v in acc.items() if v["n"]>0]
+    avg_list = [ (v["sum"]/v["n"], s) for s, v in acc.items() if v["n"]>0 ]
     avg_list.sort(reverse=True, key=lambda x: x[0])
     top = [sig for _, sig in avg_list[:top_k]]
     return [sig.split(",") for sig in top]
@@ -210,7 +187,7 @@ def login_user(username: str, password: str):
     row = db_user_get(username)
     if not row:
         return False, "Usuario no encontrado."
-    if row.get("password_hash") != _hash_password(password):
+    if row["password_hash"] != _hash_password(password):
         return False, "Contraseña incorrecta."
     return True, "Bienvenido/a."
 
@@ -263,7 +240,6 @@ def violates_rules(players_in_lineup: List[str], team: Team) -> Tuple[bool, List
         violates = bool(apart_hits or together_misses)
         return violates, [], []
     else:
-        # solo avisos suaves de 'no juntas' en modo no estricto
         return False, apart_hits, []
 
 # ===========================
@@ -273,7 +249,7 @@ def validate_schedule(team: Team, schedule: Schedule) -> Dict[str, List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
 
-    # 1) Quintetos definidos y sin duplicados
+    # 1) Tamaño/quintetos definidos y sin duplicados
     for p in range(1, schedule.periods + 1):
         l = schedule.lineups.get(p)
         if not l:
@@ -329,7 +305,7 @@ def validate_schedule(team: Team, schedule: Schedule) -> Dict[str, List[str]]:
         l = schedule.lineups.get(p)
         if not l:
             continue
-        hard, soft_apart, _ = violates_rules(l.players, team)
+        hard, soft_apart, soft_together = violates_rules(l.players, team)
         if hard:
             errors.append(f"Periodo {p}: violación de reglas personalizadas.")
         else:
@@ -455,7 +431,7 @@ def generate_automatic_schedule(team: Team, seed_top_lineups: bool = True, varia
             if len(lineup) >= 5:
                 best_idx, best_gap = None, 1e9
                 for i, out_pid in enumerate(lineup):
-                    if out_pid in (a, b):
+                    if out_pid in (a, b):  # no quites a la pareja
                         continue
                     bad = False
                     for x, y in apart_pairs:
@@ -474,7 +450,7 @@ def generate_automatic_schedule(team: Team, seed_top_lineups: bool = True, varia
                     lineup = lineup + [missing]
         return lineup[:5]
 
-    # Semilla: mejores quintetos valorados
+    # Semilla de valoraciones
     seeded_periods = set()
     if seed_top_lineups:
         top_lineups = db_top_lineups(team.id, top_k=3)
@@ -585,12 +561,12 @@ def generate_automatic_schedule(team: Team, seed_top_lineups: bool = True, varia
         current = lineup_score(players)
         tries = 0
         while abs(current - target_score) > tolerance and tries < 40:
-            out_idx = random.randrange(0, 5)
+            out_idx = rng.randrange(0, 5)
             out_pid = players[out_idx]
             outsider = [q for q in player_ids if q not in players]
             if not outsider:
                 break
-            in_pid = random.choice(outsider)
+            in_pid = rng.choice(outsider)
             if creates_three_streak(in_pid, p, schedule.lineups):
                 tries += 1; continue
             trial = players.copy(); trial[out_idx] = in_pid
@@ -987,7 +963,7 @@ def page_rules():
                     st.write(f"- {player_labels.get(x, x)}  /  {player_labels.get(y, y)}")
                 with cols[1]:
                     if st.button("🗑️", key=f"del_apart_{x}_{y}"):
-                        db_rules_delete_pair(team.id, "rules_apart", x, y)
+                        db_rules_delete_pair(team.id, "rules_apart", *sorted([x,y]))
                         st.warning("Par eliminado."); st.rerun()
 
     # --- Sí juntas (añadir varias) ---
@@ -1017,7 +993,7 @@ def page_rules():
                     st.write(f"- {player_labels.get(x, x)}  /  {player_labels.get(y, y)}")
                 with cols[1]:
                     if st.button("🗑️", key=f"del_together_{x}_{y}"):
-                        db_rules_delete_pair(team.id, "rules_together", x, y)
+                        db_rules_delete_pair(team.id, "rules_together", *sorted([x,y]))
                         st.warning("Par eliminado."); st.rerun()
 
     st.info("Las reglas se aplican en la validación y en la generación automática. En modo no estricto, solo se avisa de 'no juntas'.")
